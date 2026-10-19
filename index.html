@@ -47,12 +47,11 @@
 <body>
   <div id="map"></div>
 
-  <!-- Search box + trails toggle -->
+  <!-- Search box + airports toggle -->
   <div id="search" class="panel">
     <input id="searchInput" type="text" placeholder="Callsign, reg, or airport" list="callsigns" autocomplete="off" />
     <datalist id="callsigns"></datalist>
     <button id="searchBtn">Find</button>
-    <label><input id="trailToggle" type="checkbox" checked /> Trails</label>
     <label title="Shows airports with weather reports when zoomed in"><input id="airportToggle" type="checkbox" checked /> Airports</label>
   </div>
 
@@ -73,13 +72,9 @@
     const statusEl = document.getElementById("status");
     const searchInput = document.getElementById("searchInput");
     const datalist = document.getElementById("callsigns");
-    const trailToggle = document.getElementById("trailToggle");
 
     const markers = new Map();   // one marker per plane
     const planes = new Map();    // latest data for each plane (used by search)
-    const trails = new Map();    // one trail per plane: { points: [...], line: polyline }
-    const trailLayer = L.layerGroup().addTo(map);
-    const MAX_TRAIL_POINTS = 40; // about 10 minutes of history at 15s updates
     let pauseUntil = 0;          // used if the data service says "slow down"
 
     // ---------- 2. Draw a plane icon ----------
@@ -105,33 +100,86 @@
         <strong>${f.callsign || "Unknown"}</strong><br>
         Registration: ${f.reg}<br>
         Aircraft type: ${f.type}<br>
+        ICAO hex: ${f.id}<br>
         Altitude: ${feet}<br>
         Speed: ${knots}<br>
         Heading: ${Math.round(f.heading)}°`;
     }
 
-    // ---------- 4. Trails ----------
-    function updateTrail(f) {
-      let t = trails.get(f.id);
-      if (!t) {
-        const line = L.polyline([], { color: "#8ab4f8", weight: 2, opacity: 0.7 });
-        trailLayer.addLayer(line);
-        t = { points: [], line };
-        trails.set(f.id, t);
-      }
-      const last = t.points[t.points.length - 1];
-      // Only add a point if the plane actually moved
-      if (!last || last[0] !== f.lat || last[1] !== f.lon) {
-        t.points.push([f.lat, f.lon]);
-        if (t.points.length > MAX_TRAIL_POINTS) t.points.shift();
-        t.line.setLatLngs(t.points);
-      }
+    // ---------- 4. Flight path (shown when you click a plane) ----------
+    // The history comes from adsb.lol's recorded flight traces, fetched through your Worker.
+    const pathLayer = L.layerGroup().addTo(map);
+    let selectedId = null;       // the plane whose path is showing
+    let pathLine = null;         // the line drawn on the map
+    let basePoints = [];         // recorded history from the departure point
+    let livePoints = [];         // positions collected while you watch (keeps the line current)
+    let pathToken = 0;           // used to ignore out-of-date downloads
+
+    function drawPath() {
+      const pts = basePoints.concat(livePoints);
+      if (pathLine) pathLine.setLatLngs(pts);
     }
 
-    trailToggle.addEventListener("change", () => {
-      if (trailToggle.checked) map.addLayer(trailLayer);
-      else map.removeLayer(trailLayer);
-    });
+    function clearSelection() {
+      selectedId = null;
+      pathToken++;               // cancels any download still in progress
+      pathLayer.clearLayers();
+      pathLine = null;
+      basePoints = [];
+      livePoints = [];
+    }
+
+    async function selectPlane(id) {
+      clearSelection();
+      selectedId = id;
+      const token = pathToken;
+
+      // Start with a line right away (just the plane's current spot)
+      pathLine = L.polyline([], { color: "#ffd54f", weight: 3, opacity: 0.9 });
+      pathLayer.addLayer(pathLine);
+      const f = planes.get(id);
+      if (f) livePoints.push([f.lat, f.lon]);
+      drawPath();
+
+      try {
+        const res = await fetch(`${WORKER}/trace/${id}`);
+        if (!res.ok) throw new Error("No history for this aircraft");
+        const data = await res.json();
+        if (token !== pathToken) return;   // you clicked something else meanwhile
+
+        const trace = data.trace || [];
+        // Each entry is [seconds after start, lat, lon, altitude, speed, heading, flags, ...].
+        // A flag of 2 marks the start of a new flight, so find the most recent one.
+        let start = 0;
+        for (let i = trace.length - 1; i >= 0; i--) {
+          if (((trace[i][6] || 0) & 2) !== 0) { start = i; break; }
+        }
+        const leg = trace.slice(start).filter(p => typeof p[1] === "number" && typeof p[2] === "number");
+        if (!leg.length) return;
+
+        basePoints = leg.map(p => [p[1], p[2]]);
+        livePoints = livePoints.slice(-1);  // the history already covers everything before now
+        drawPath();
+
+        // Mark where the flight began
+        const first = leg[0];
+        const onGround = first[3] === "ground";
+        const when = data.timestamp != null
+          ? new Date((data.timestamp + first[0]) * 1000)
+              .toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })
+          : "";
+        const label = onGround
+          ? `Departed${when ? " " + when : ""}`
+          : "Earliest recorded point";
+        pathLayer.addLayer(
+          L.circleMarker([first[1], first[2]], {
+            radius: 6, color: "#fff", weight: 2, fillColor: "#34a853", fillOpacity: 1,
+          }).bindTooltip(label, { permanent: true, direction: "top", offset: [0, -6] })
+        );
+      } catch (err) {
+        console.error(err);   // no history available: the line just follows the plane from now on
+      }
+    }
 
     // ---------- 5. Search ----------
     // Fly to a plane and open its popup
@@ -287,7 +335,15 @@
         for (const f of flights) {
           stillHere.add(f.id);
           planes.set(f.id, f);
-          updateTrail(f);
+
+          // Keep the selected plane's path growing while you watch it
+          if (f.id === selectedId) {
+            const last = livePoints[livePoints.length - 1];
+            if (!last || last[0] !== f.lat || last[1] !== f.lon) {
+              livePoints.push([f.lat, f.lon]);
+              drawPath();
+            }
+          }
 
           const now = performance.now();
           const v = velocity(f);
@@ -313,6 +369,8 @@
             // New plane: add it
             const icon = planeIcon(f.heading, f.altitudeM, f.onGround);
             const m = L.marker([f.lat, f.lon], { icon }).addTo(map).bindPopup(popupHtml(f));
+            m.on("popupopen", () => selectPlane(f.id));
+            m.on("popupclose", () => { if (selectedId === f.id) clearSelection(); });
             markers.set(f.id, m);
             motion.set(f.id, {
               lat: f.lat, lon: f.lon, t: now,
@@ -322,14 +380,12 @@
           }
         }
 
-        // Remove planes (and their trails) that are gone
+        // Remove planes that are gone
         for (const [id, m] of markers) {
           if (!stillHere.has(id)) {
             map.removeLayer(m);
             markers.delete(id);
             motion.delete(id);
-            const t = trails.get(id);
-            if (t) { trailLayer.removeLayer(t.line); trails.delete(id); }
           }
         }
 
