@@ -36,7 +36,7 @@
 
     const statusEl = document.getElementById("status");
     const markers = new Map();   // remembers one marker per plane
-    let pauseUntil = 0;          // used if OpenSky says "slow down"
+    let pauseUntil = 0;          // used if the data service says "slow down"
 
     // ---------- 2. Draw a plane icon ----------
     // Color depends on altitude: gray = on ground, yellow = low, green = mid, blue = high
@@ -55,11 +55,12 @@
 
     // ---------- 3. The text shown when you click a plane ----------
     function popupHtml(f) {
-      const feet = f.altitudeM != null ? Math.round(f.altitudeM * 3.28084).toLocaleString() + " ft" : "n/a";
+      const feet = f.onGround ? "On ground" : Math.round(f.altitudeM * 3.28084).toLocaleString() + " ft";
       const knots = f.speedMs != null ? Math.round(f.speedMs * 1.94384) + " kt" : "n/a";
       return `
         <strong>${f.callsign || "Unknown"}</strong><br>
-        Country: ${f.country}<br>
+        Registration: ${f.reg}<br>
+        Aircraft type: ${f.type}<br>
         Altitude: ${feet}<br>
         Speed: ${knots}<br>
         Heading: ${Math.round(f.heading)}°`;
@@ -69,15 +70,15 @@
     async function refresh() {
       if (Date.now() < pauseUntil) return;
 
-      // Ask only for planes inside the part of the map you can see
-      const b = map.getBounds();
-      const params = new URLSearchParams({
-        lamin: b.getSouth().toFixed(2), lomin: b.getWest().toFixed(2),
-        lamax: b.getNorth().toFixed(2), lomax: b.getEast().toFixed(2),
-      });
+      // Center of the visible map, and the distance to its corner (= radius)
+      const center = map.getCenter();
+      const corner = map.getBounds().getNorthEast();
+      const radiusNm = Math.min(250, Math.ceil(map.distance(center, corner) / 1852));
+
+      const url = `https://api.adsb.lol/v2/point/${center.lat.toFixed(3)}/${center.lng.toFixed(3)}/${radiusNm}`;
 
       try {
-        const res = await fetch("https://flight-proxy.ericdoorman1027.workers.dev/?" + params);
+        const res = await fetch(url);
 
         if (res.status === 429) {            // "too many requests"
           pauseUntil = Date.now() + 60000;   // wait one minute
@@ -88,26 +89,30 @@
 
         const data = await res.json();
 
-        // OpenSky sends each plane as a list of numbers. Turn it into a readable object.
-        const flights = (data.states || [])
-          .filter(s => s[5] !== null && s[6] !== null)   // skip planes with no position
-          .map(s => ({
-            id: s[0],
-            callsign: (s[1] || "").trim(),
-            country: s[2],
-            lon: s[5],
-            lat: s[6],
-            altitudeM: s[7],
-            onGround: s[8],
-            speedMs: s[9],
-            heading: s[10] ?? 0,
-          }));
+        // Convert adsb.lol's format into the fields the rest of the code uses
+        const flights = (data.ac || [])
+          .filter(a => a.lat != null && a.lon != null)
+          .map(a => {
+            const onGround = a.alt_baro === "ground";
+            return {
+              id: a.hex,
+              callsign: (a.flight || "").trim(),
+              reg: a.r || "n/a",
+              type: a.t || "n/a",
+              lat: a.lat,
+              lon: a.lon,
+              altitudeM: onGround || a.alt_baro == null ? 0 : a.alt_baro * 0.3048, // feet to meters
+              onGround,
+              speedMs: a.gs != null ? a.gs / 1.94384 : null,                        // knots to m/s
+              heading: a.track ?? 0,
+            };
+          });
 
         const stillHere = new Set();
 
         for (const f of flights) {
           stillHere.add(f.id);
-          const icon = planeIcon(f.heading, f.altitudeM ?? 0, f.onGround);
+          const icon = planeIcon(f.heading, f.altitudeM, f.onGround);
           const existing = markers.get(f.id);
 
           if (existing) {
@@ -129,6 +134,7 @@
 
         statusEl.textContent = `${flights.length} aircraft · updated ${new Date().toLocaleTimeString()}`;
       } catch (err) {
+        console.error(err);
         statusEl.textContent = "Data unavailable, retrying…";
       }
     }
