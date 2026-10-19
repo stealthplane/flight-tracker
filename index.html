@@ -53,6 +53,7 @@
     <datalist id="callsigns"></datalist>
     <button id="searchBtn">Find</button>
     <label><input id="trailToggle" type="checkbox" checked /> Trails</label>
+    <label title="Shows airports with weather reports when zoomed in"><input id="airportToggle" type="checkbox" checked /> Airports</label>
   </div>
 
   <div id="status" class="panel">Loading…</div>
@@ -247,15 +248,132 @@
       }
     }
 
-    // ---------- 7. Keep it updating ----------
-    refresh();                          // once right away
+    // ---------- 7. Airports and their weather ----------
+    // Weather comes from aviationweather.gov (official METAR reports),
+    // fetched through your Cloudflare Worker.
+    const WORKER = "https://flight-proxy.ericdoorman1027.workers.dev";
+    const airportToggle = document.getElementById("airportToggle");
+    const airportLayer = L.layerGroup().addTo(map);
+    const airports = new Map();       // airport code -> map marker
+    const MIN_AIRPORT_ZOOM = 7;       // airports only show when zoomed in this far
+
+    // Flight category colors: green = VFR, blue = MVFR, red = IFR, purple = LIFR
+    const CAT_COLORS = { VFR: "#34a853", MVFR: "#4285f4", IFR: "#ea4335", LIFR: "#c026d3" };
+
+    // Make text safe to put inside HTML
+    function esc(s) {
+      return String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+    }
+
+    function windText(m) {
+      if (m.wspd == null) return "n/a";
+      if (m.wspd === 0) return "Calm";
+      const dir = (m.wdir == null || m.wdir === "VRB") ? "Variable" : String(m.wdir).padStart(3, "0") + "°";
+      return `${dir} at ${m.wspd} kt` + (m.wgst ? `, gusting ${m.wgst} kt` : "");
+    }
+
+    function cloudText(m) {
+      if (!m.clouds || !m.clouds.length) return "n/a";
+      return m.clouds
+        .map(c => c.base != null ? `${c.cover} ${Number(c.base).toLocaleString()} ft` : c.cover)
+        .join(", ");
+    }
+
+    function tempText(c) {
+      if (c == null) return "n/a";
+      return `${c}°C (${Math.round(c * 9 / 5 + 32)}°F)`;
+    }
+
+    function altimText(a) {
+      if (a == null) return "n/a";
+      const inHg = a > 100 ? a * 0.02953 : a;   // the service reports hectopascals
+      return inHg.toFixed(2) + " inHg";
+    }
+
+    function airportPopup(m) {
+      const cat = m.fltCat || "n/a";
+      const color = CAT_COLORS[cat] || "#888";
+      const time = m.obsTime
+        ? new Date(m.obsTime * 1000).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })
+        : "n/a";
+      return `
+        <strong>${esc(m.icaoId)}</strong> · ${esc(m.name || "")}<br>
+        <span style="color:${color}; font-weight:600;">${esc(cat)}</span>
+        <small>(observed ${esc(time)})</small><br>
+        Wind: ${esc(windText(m))}<br>
+        Visibility: ${m.visib != null ? esc(m.visib) + " mi" : "n/a"}<br>
+        Clouds: ${esc(cloudText(m))}<br>
+        Temp / Dew point: ${esc(tempText(m.temp))} / ${esc(tempText(m.dewp))}<br>
+        Altimeter: ${esc(altimText(m.altim))}<br>
+        <small style="font-family:monospace;">${esc(m.rawOb || "")}</small>`;
+    }
+
+    function clearAirports() {
+      airportLayer.clearLayers();
+      airports.clear();
+    }
+
+    async function loadAirports() {
+      if (!airportToggle.checked || map.getZoom() < MIN_AIRPORT_ZOOM) {
+        clearAirports();
+        return;
+      }
+
+      const b = map.getBounds();
+      const bbox = [b.getSouth(), b.getWest(), b.getNorth(), b.getEast()]
+        .map(v => v.toFixed(2)).join(",");
+
+      try {
+        const res = await fetch(`${WORKER}/metar?bbox=${bbox}`);
+        let stations = [];
+        if (res.status !== 204) {                 // 204 means "no airports here"
+          if (!res.ok) throw new Error("Weather request failed");
+          stations = await res.json();
+        }
+
+        const seen = new Set();
+        for (const m of stations) {
+          if (m.lat == null || m.lon == null || !m.icaoId) continue;
+          seen.add(m.icaoId);
+          const color = CAT_COLORS[m.fltCat] || "#9aa0a6";
+          const existing = airports.get(m.icaoId);
+
+          if (existing) {
+            existing.setStyle({ fillColor: color });
+            existing.setPopupContent(airportPopup(m));
+          } else {
+            const marker = L.circleMarker([m.lat, m.lon], {
+              radius: 7, color: "#fff", weight: 1.5, fillColor: color, fillOpacity: 0.95,
+            })
+              .bindPopup(airportPopup(m))
+              .bindTooltip(m.icaoId);
+            airportLayer.addLayer(marker);
+            airports.set(m.icaoId, marker);
+          }
+        }
+
+        // Remove airports that are no longer in view
+        for (const [id, marker] of airports) {
+          if (!seen.has(id)) { airportLayer.removeLayer(marker); airports.delete(id); }
+        }
+      } catch (err) {
+        console.error(err);   // airports are optional, so fail quietly
+      }
+    }
+
+    airportToggle.addEventListener("change", loadAirports);
+
+    // ---------- 8. Keep it updating ----------
+    refresh();                          // planes: once right away
     setInterval(refresh, 15000);        // then every 15 seconds
+    loadAirports();                     // airports: once right away
+    setInterval(loadAirports, 300000);  // then every 5 minutes (weather changes slowly)
 
     // Also refresh after the user drags or zooms, but wait until they stop
     let timer;
     map.on("moveend", () => {
       clearTimeout(timer);
-      timer = setTimeout(refresh, 1000);
+      timer = setTimeout(() => { refresh(); loadAirports(); }, 1000);
     });
   </script>
 </body>
