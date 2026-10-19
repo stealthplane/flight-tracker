@@ -77,7 +77,7 @@
       });
 
       try {
-        const res = await fetch("https://opensky-network.org/api/states/all?" + params);
+        const res = await fetch("https://flight-proxy.ericdoorman1027.workers.dev/?" + params);
 
         if (res.status === 429) {            // "too many requests"
           pauseUntil = Date.now() + 60000;   // wait one minute
