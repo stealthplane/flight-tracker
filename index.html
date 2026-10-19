@@ -12,6 +12,11 @@
     html, body { height: 100%; margin: 0; font-family: system-ui, sans-serif; background: #111; }
     #map { height: 100%; background: #111; }
 
+    /* Turn the normal map into a dark map by inverting its colors */
+    .leaflet-tile-pane {
+      filter: invert(100%) hue-rotate(180deg) brightness(95%) contrast(90%);
+    }
+
     /* Panels floating over the map */
     .panel {
       position: absolute; z-index: 1000;
@@ -58,10 +63,10 @@
     // The two numbers are latitude and longitude. Change them to look elsewhere.
     const map = L.map("map").setView([42.55, -71.76], 8);
 
-    L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", {
-      subdomains: "abcd",
-      maxZoom: 19,
-      attribution: "&copy; OpenStreetMap contributors &copy; CARTO",
+    // Normal OpenStreetMap tiles; the CSS filter above turns them dark
+    L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      maxZoom: 18,
+      attribution: "&copy; OpenStreetMap contributors",
     }).addTo(map);
 
     const statusEl = document.getElementById("status");
