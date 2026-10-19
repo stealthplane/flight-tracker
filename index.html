@@ -75,7 +75,7 @@
       const corner = map.getBounds().getNorthEast();
       const radiusNm = Math.min(250, Math.ceil(map.distance(center, corner) / 1852));
 
-      const url = `https://api.adsb.lol/v2/point/${center.lat.toFixed(3)}/${center.lng.toFixed(3)}/${radiusNm}`;
+      const url = `https://flight-proxy.ericdoorman1027.workers.dev/${center.lat.toFixed(3)}/${center.lng.toFixed(3)}/${radiusNm}`;
 
       try {
         const res = await fetch(url);
