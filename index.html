@@ -26,7 +26,7 @@
     #status { top: 10px; right: 10px; }
     #search { top: 10px; left: 60px; display: flex; gap: 6px; align-items: center; }
     #search input[type="text"] {
-      width: 150px; padding: 5px 8px; border-radius: 6px;
+      width: 190px; padding: 5px 8px; border-radius: 6px;
       border: 1px solid #3c4352; background: #0d1017; color: #fff; font-size: 13px;
     }
     #search button {
@@ -49,7 +49,7 @@
 
   <!-- Search box + trails toggle -->
   <div id="search" class="panel">
-    <input id="searchInput" type="text" placeholder="Callsign or reg" list="callsigns" autocomplete="off" />
+    <input id="searchInput" type="text" placeholder="Callsign, reg, or airport" list="callsigns" autocomplete="off" />
     <datalist id="callsigns"></datalist>
     <button id="searchBtn">Find</button>
     <label><input id="trailToggle" type="checkbox" checked /> Trails</label>
@@ -134,29 +134,66 @@
     });
 
     // ---------- 5. Search ----------
-    function doSearch() {
+    // Fly to a plane and open its popup
+    function goToPlane(f) {
+      map.flyTo([f.lat, f.lon], Math.max(map.getZoom(), 9));
+      const m = markers.get(f.id);
+      if (m) m.openPopup();
+    }
+
+    // Fly to an airport that is already on the map and open its popup
+    function goToLoadedAirport(a) {
+      map.flyTo([a.lat, a.lon], Math.max(map.getZoom(), 10));
+      const marker = airports.get(a.id);
+      if (marker) marker.openPopup();
+    }
+
+    async function doSearch() {
       const q = searchInput.value.trim().toUpperCase();
       if (!q) return;
 
-      let found = null;
-      // First look for an exact match on callsign or registration...
-      for (const f of planes.values()) {
-        if (f.callsign.toUpperCase() === q || f.reg.toUpperCase() === q) { found = f; break; }
-      }
-      // ...then for a partial match
-      if (!found) {
-        for (const f of planes.values()) {
-          if (f.callsign.toUpperCase().includes(q) || f.reg.toUpperCase().includes(q)) { found = f; break; }
+      const planeList = [...planes.values()];
+      const airportList = [...airportData.values()];
+
+      // 1. Exact plane match (callsign or registration)
+      let plane = planeList.find(f => f.callsign.toUpperCase() === q || f.reg.toUpperCase() === q);
+      if (plane) return goToPlane(plane);
+
+      // 2. Exact airport code match among airports already loaded
+      let airport = airportList.find(a => a.id.toUpperCase() === q);
+      if (airport) return goToLoadedAirport(airport);
+
+      // 3. Partial plane match
+      plane = planeList.find(f => f.callsign.toUpperCase().includes(q) || f.reg.toUpperCase().includes(q));
+      if (plane) return goToPlane(plane);
+
+      // 4. Partial airport match (code or name) among airports already loaded
+      airport = airportList.find(a => a.id.toUpperCase().includes(q) || a.name.toUpperCase().includes(q));
+      if (airport) return goToLoadedAirport(airport);
+
+      // 5. Look the airport up anywhere in the world by its code (e.g. KFIT, or just FIT for US airports)
+      if (/^[A-Z0-9]{3,4}$/.test(q)) {
+        statusEl.textContent = `Looking up ${q}…`;
+        const codes = q.length === 3 ? ["K" + q, q] : [q];
+        for (const code of codes) {
+          try {
+            const res = await fetch(`${WORKER}/metar?ids=${code}`);
+            if (res.status === 204 || !res.ok) continue;
+            const list = await res.json();
+            if (list && list.length && list[0].lat != null) {
+              const a = list[0];
+              airportToggle.checked = true;
+              pendingAirportPopup = a.icaoId;       // open its popup once it loads
+              map.flyTo([a.lat, a.lon], 11);
+              return;
+            }
+          } catch (err) {
+            console.error(err);
+          }
         }
       }
 
-      if (found) {
-        map.flyTo([found.lat, found.lon], Math.max(map.getZoom(), 9));
-        const m = markers.get(found.id);
-        if (m) m.openPopup();
-      } else {
-        statusEl.textContent = `No aircraft matching "${q}" in the current map area`;
-      }
+      statusEl.textContent = `Nothing found for "${q}". Try a callsign, registration, or airport code like KFIT.`;
     }
 
     document.getElementById("searchBtn").addEventListener("click", doSearch);
@@ -255,6 +292,8 @@
     const airportToggle = document.getElementById("airportToggle");
     const airportLayer = L.layerGroup().addTo(map);
     const airports = new Map();       // airport code -> map marker
+    const airportData = new Map();    // airport code -> { id, name, lat, lon } (used by search)
+    let pendingAirportPopup = null;   // airport to open a popup for once it appears
     const MIN_AIRPORT_ZOOM = 7;       // airports only show when zoomed in this far
 
     // Flight category colors: green = VFR, blue = MVFR, red = IFR, purple = LIFR
@@ -311,6 +350,7 @@
     function clearAirports() {
       airportLayer.clearLayers();
       airports.clear();
+      airportData.clear();
     }
 
     async function loadAirports() {
@@ -350,11 +390,22 @@
             airportLayer.addLayer(marker);
             airports.set(m.icaoId, marker);
           }
+          airportData.set(m.icaoId, { id: m.icaoId, name: m.name || "", lat: m.lat, lon: m.lon });
         }
 
         // Remove airports that are no longer in view
         for (const [id, marker] of airports) {
-          if (!seen.has(id)) { airportLayer.removeLayer(marker); airports.delete(id); }
+          if (!seen.has(id)) {
+            airportLayer.removeLayer(marker);
+            airports.delete(id);
+            airportData.delete(id);
+          }
+        }
+
+        // If the user searched for an airport, open its popup now that it's on the map
+        if (pendingAirportPopup && airports.has(pendingAirportPopup)) {
+          airports.get(pendingAirportPopup).openPopup();
+          pendingAirportPopup = null;
         }
       } catch (err) {
         console.error(err);   // airports are optional, so fail quietly
