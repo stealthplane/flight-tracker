@@ -9,33 +9,71 @@
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 
   <style>
-    html, body { height: 100%; margin: 0; font-family: system-ui, sans-serif; }
-    #map { height: 100%; }
-    #status {
-      position: absolute; top: 10px; right: 10px; z-index: 1000;
-      background: rgba(20, 24, 33, .9); color: #fff;
+    html, body { height: 100%; margin: 0; font-family: system-ui, sans-serif; background: #111; }
+    #map { height: 100%; background: #111; }
+
+    /* Panels floating over the map */
+    .panel {
+      position: absolute; z-index: 1000;
+      background: rgba(20, 24, 33, .92); color: #fff;
       padding: 8px 12px; border-radius: 8px; font-size: 13px;
     }
-    .plane svg { width: 26px; height: 26px; }
+    #status { top: 10px; right: 10px; }
+    #search { top: 10px; left: 60px; display: flex; gap: 6px; align-items: center; }
+    #search input[type="text"] {
+      width: 150px; padding: 5px 8px; border-radius: 6px;
+      border: 1px solid #3c4352; background: #0d1017; color: #fff; font-size: 13px;
+    }
+    #search button {
+      padding: 5px 10px; border-radius: 6px; border: 0;
+      background: #4285f4; color: #fff; font-size: 13px; cursor: pointer;
+    }
+    #search label { display: flex; align-items: center; gap: 4px; cursor: pointer; white-space: nowrap; }
+
+    .plane svg { width: 26px; height: 26px; filter: drop-shadow(0 0 2px rgba(0,0,0,.8)); }
+
+    /* Keep the narrow-screen layout from overlapping */
+    @media (max-width: 600px) {
+      #search { left: 60px; right: 10px; flex-wrap: wrap; }
+      #status { top: auto; bottom: 24px; right: 10px; }
+    }
   </style>
 </head>
 <body>
   <div id="map"></div>
-  <div id="status">Loading…</div>
+
+  <!-- Search box + trails toggle -->
+  <div id="search" class="panel">
+    <input id="searchInput" type="text" placeholder="Callsign or reg" list="callsigns" autocomplete="off" />
+    <datalist id="callsigns"></datalist>
+    <button id="searchBtn">Find</button>
+    <label><input id="trailToggle" type="checkbox" checked /> Trails</label>
+  </div>
+
+  <div id="status" class="panel">Loading…</div>
 
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script>
-    // ---------- 1. Set up the map ----------
+    // ---------- 1. Set up the map (dark style) ----------
     // The two numbers are latitude and longitude. Change them to look elsewhere.
     const map = L.map("map").setView([42.55, -71.76], 8);
 
-    L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
-      maxZoom: 18,
-      attribution: "&copy; OpenStreetMap contributors",
+    L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", {
+      subdomains: "abcd",
+      maxZoom: 19,
+      attribution: "&copy; OpenStreetMap contributors &copy; CARTO",
     }).addTo(map);
 
     const statusEl = document.getElementById("status");
-    const markers = new Map();   // remembers one marker per plane
+    const searchInput = document.getElementById("searchInput");
+    const datalist = document.getElementById("callsigns");
+    const trailToggle = document.getElementById("trailToggle");
+
+    const markers = new Map();   // one marker per plane
+    const planes = new Map();    // latest data for each plane (used by search)
+    const trails = new Map();    // one trail per plane: { points: [...], line: polyline }
+    const trailLayer = L.layerGroup().addTo(map);
+    const MAX_TRAIL_POINTS = 40; // about 10 minutes of history at 15s updates
     let pauseUntil = 0;          // used if the data service says "slow down"
 
     // ---------- 2. Draw a plane icon ----------
@@ -47,7 +85,7 @@
         : "#4285f4";
       const svg = `
         <svg viewBox="0 0 24 24" style="transform: rotate(${heading}deg)">
-          <path fill="${color}" stroke="#111" stroke-width="0.6"
+          <path fill="${color}" stroke="#fff" stroke-width="0.5"
             d="M21 16v-2l-8-5V3.5a1.5 1.5 0 0 0-3 0V9l-8 5v2l8-2.5V19l-2 1.5V22l3.5-1 3.5 1v-1.5L13 19v-5.5z"/>
         </svg>`;
       return L.divIcon({ html: svg, className: "plane", iconSize: [26, 26], iconAnchor: [13, 13] });
@@ -66,7 +104,59 @@
         Heading: ${Math.round(f.heading)}°`;
     }
 
-    // ---------- 4. Get planes and put them on the map ----------
+    // ---------- 4. Trails ----------
+    function updateTrail(f) {
+      let t = trails.get(f.id);
+      if (!t) {
+        const line = L.polyline([], { color: "#8ab4f8", weight: 2, opacity: 0.7 });
+        trailLayer.addLayer(line);
+        t = { points: [], line };
+        trails.set(f.id, t);
+      }
+      const last = t.points[t.points.length - 1];
+      // Only add a point if the plane actually moved
+      if (!last || last[0] !== f.lat || last[1] !== f.lon) {
+        t.points.push([f.lat, f.lon]);
+        if (t.points.length > MAX_TRAIL_POINTS) t.points.shift();
+        t.line.setLatLngs(t.points);
+      }
+    }
+
+    trailToggle.addEventListener("change", () => {
+      if (trailToggle.checked) map.addLayer(trailLayer);
+      else map.removeLayer(trailLayer);
+    });
+
+    // ---------- 5. Search ----------
+    function doSearch() {
+      const q = searchInput.value.trim().toUpperCase();
+      if (!q) return;
+
+      let found = null;
+      // First look for an exact match on callsign or registration...
+      for (const f of planes.values()) {
+        if (f.callsign.toUpperCase() === q || f.reg.toUpperCase() === q) { found = f; break; }
+      }
+      // ...then for a partial match
+      if (!found) {
+        for (const f of planes.values()) {
+          if (f.callsign.toUpperCase().includes(q) || f.reg.toUpperCase().includes(q)) { found = f; break; }
+        }
+      }
+
+      if (found) {
+        map.flyTo([found.lat, found.lon], Math.max(map.getZoom(), 9));
+        const m = markers.get(found.id);
+        if (m) m.openPopup();
+      } else {
+        statusEl.textContent = `No aircraft matching "${q}" in the current map area`;
+      }
+    }
+
+    document.getElementById("searchBtn").addEventListener("click", doSearch);
+    searchInput.addEventListener("keydown", e => { if (e.key === "Enter") doSearch(); });
+
+    // ---------- 6. Get planes and put them on the map ----------
     async function refresh() {
       if (Date.now() < pauseUntil) return;
 
@@ -109,9 +199,13 @@
           });
 
         const stillHere = new Set();
+        planes.clear();
 
         for (const f of flights) {
           stillHere.add(f.id);
+          planes.set(f.id, f);
+          updateTrail(f);
+
           const icon = planeIcon(f.heading, f.altitudeM, f.onGround);
           const existing = markers.get(f.id);
 
@@ -127,10 +221,19 @@
           }
         }
 
-        // Remove planes that are gone
+        // Remove planes (and their trails) that are gone
         for (const [id, m] of markers) {
-          if (!stillHere.has(id)) { map.removeLayer(m); markers.delete(id); }
+          if (!stillHere.has(id)) {
+            map.removeLayer(m);
+            markers.delete(id);
+            const t = trails.get(id);
+            if (t) { trailLayer.removeLayer(t.line); trails.delete(id); }
+          }
         }
+
+        // Refresh the search suggestions
+        const names = [...new Set(flights.map(f => f.callsign).filter(Boolean))].sort().slice(0, 300);
+        datalist.innerHTML = names.map(n => `<option value="${n}"></option>`).join("");
 
         statusEl.textContent = `${flights.length} aircraft · updated ${new Date().toLocaleTimeString()}`;
       } catch (err) {
@@ -139,7 +242,7 @@
       }
     }
 
-    // ---------- 5. Keep it updating ----------
+    // ---------- 7. Keep it updating ----------
     refresh();                          // once right away
     setInterval(refresh, 15000);        // then every 15 seconds
 
