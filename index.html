@@ -199,9 +199,49 @@
     document.getElementById("searchBtn").addEventListener("click", doSearch);
     searchInput.addEventListener("keydown", e => { if (e.key === "Enter") doSearch(); });
 
-    // ---------- 6. Get planes and put them on the map ----------
+    // ---------- 6. Smooth movement ----------
+    // Between data updates, each plane keeps gliding in the direction it's flying
+    // at its current speed. When fresh data arrives, the plane eases to the
+    // corrected position instead of jumping.
+    const motion = new Map();   // plane id -> movement info
+
+    function velocity(f) {
+      if (f.onGround || f.speedMs == null || f.speedMs < 2) return { vLat: 0, vLon: 0 };
+      const h = f.heading * Math.PI / 180;
+      return {
+        vLat: f.speedMs * Math.cos(h) / 111320,                                   // degrees per second
+        vLon: f.speedMs * Math.sin(h) / (111320 * Math.cos(f.lat * Math.PI / 180)),
+      };
+    }
+
+    // Only redraw a plane's icon when its look actually changes (saves a lot of work)
+    function iconKey(f) {
+      const band = f.onGround ? "g" : f.altitudeM < 3000 ? "l" : f.altitudeM < 8000 ? "m" : "h";
+      return Math.round(f.heading / 3) + band;
+    }
+
+    let lastFrame = 0;
+    function animate(ts) {
+      requestAnimationFrame(animate);
+      if (document.hidden || ts - lastFrame < 66) return;   // about 15 frames per second
+      lastFrame = ts;
+
+      for (const [id, st] of motion) {
+        const m = markers.get(id);
+        if (!m) continue;
+        const dt = Math.max(0, Math.min(ts - st.t, 30000)) / 1000;  // seconds since last update
+        const k = Math.max(0, 1 - dt / 2);                          // correction fades out over 2s
+        m.setLatLng([
+          st.lat + st.vLat * dt + st.offLat * k,
+          st.lon + st.vLon * dt + st.offLon * k,
+        ]);
+      }
+    }
+    requestAnimationFrame(animate);
+
+    // ---------- 7. Get planes and put them on the map ----------
     async function refresh() {
-      if (Date.now() < pauseUntil) return;
+      if (Date.now() < pauseUntil || document.hidden) return;
 
       // Center of the visible map, and the distance to its corner (= radius)
       const center = map.getCenter();
@@ -249,18 +289,36 @@
           planes.set(f.id, f);
           updateTrail(f);
 
-          const icon = planeIcon(f.heading, f.altitudeM, f.onGround);
+          const now = performance.now();
+          const v = velocity(f);
+          const key = iconKey(f);
           const existing = markers.get(f.id);
+          const st = motion.get(f.id);
 
-          if (existing) {
-            // Plane already on the map: just move it
-            existing.setLatLng([f.lat, f.lon]);
-            existing.setIcon(icon);
+          if (existing && st) {
+            // Plane already on the map: remember where it is drawn right now,
+            // so it can ease toward the corrected position instead of jumping
+            const cur = existing.getLatLng();
+            st.offLat = cur.lat - f.lat;
+            st.offLon = cur.lng - f.lon;
+            st.lat = f.lat; st.lon = f.lon; st.t = now;
+            st.vLat = v.vLat; st.vLon = v.vLon;
+
+            if (st.iconKey !== key) {
+              existing.setIcon(planeIcon(f.heading, f.altitudeM, f.onGround));
+              st.iconKey = key;
+            }
             existing.setPopupContent(popupHtml(f));
           } else {
             // New plane: add it
+            const icon = planeIcon(f.heading, f.altitudeM, f.onGround);
             const m = L.marker([f.lat, f.lon], { icon }).addTo(map).bindPopup(popupHtml(f));
             markers.set(f.id, m);
+            motion.set(f.id, {
+              lat: f.lat, lon: f.lon, t: now,
+              vLat: v.vLat, vLon: v.vLon,
+              offLat: 0, offLon: 0, iconKey: key,
+            });
           }
         }
 
@@ -269,6 +327,7 @@
           if (!stillHere.has(id)) {
             map.removeLayer(m);
             markers.delete(id);
+            motion.delete(id);
             const t = trails.get(id);
             if (t) { trailLayer.removeLayer(t.line); trails.delete(id); }
           }
@@ -416,7 +475,7 @@
 
     // ---------- 8. Keep it updating ----------
     refresh();                          // planes: once right away
-    setInterval(refresh, 15000);        // then every 15 seconds
+    setInterval(refresh, 5000);         // then every 5 seconds
     loadAirports();                     // airports: once right away
     setInterval(loadAirports, 300000);  // then every 5 minutes (weather changes slowly)
 
@@ -424,7 +483,7 @@
     let timer;
     map.on("moveend", () => {
       clearTimeout(timer);
-      timer = setTimeout(() => { refresh(); loadAirports(); }, 1000);
+      timer = setTimeout(() => { refresh(); loadAirports(); }, 500);
     });
   </script>
 </body>
